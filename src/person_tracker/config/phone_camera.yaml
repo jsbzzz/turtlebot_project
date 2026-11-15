@@ -1,0 +1,43 @@
+# ==============================================================================
+# 상단 추가 카메라(핸드폰) 고정 설정 파일 (config/phone_camera.yaml)
+# - 기본 터틀봇 카메라(/robot4/oakd/...)와 토픽/프레임이 겹치지 않도록
+#   상단 캠 전용 이름(top_cam)으로 분리되어 있습니다.
+# ==============================================================================
+
+namespace: "/robot4"
+video_source: "http://192.168.108.100:4747/video"   # 스마트폰 DroidCam URL 또는 웹캠 번호("2")
+
+topics:
+  raw_topic: "/top_cam/image_raw"                   # 실제 발행: /robot4/top_cam/image_raw
+  compressed_topic: "/top_cam/image_raw/compressed" # 실제 발행: /robot4/top_cam/image_raw/compressed
+  publish_raw: false                                # Wi-Fi 대역폭 절약을 위해 압축 토픽만 기본 활성화
+  publish_compressed: true
+
+frames:
+  parent_frame: "oakd_rgb_camera_frame"             # 기준: 터틀봇 기본 카메라 프레임 (또는 oakd_link)
+  camera_link_frame: "top_cam_link"                 # 상단 캠 몸체 프레임 (+X 정면, +Y 왼쪽, +Z 위)
+  optical_frame: "top_cam_optical_frame"            # 상단 캠 광학 프레임 (+Z 정면, +X 오른쪽, +Y 아래)
+
+# parent_frame 기준 상단 캠의 상대 위치 및 회전
+# - 터틀봇 기본 카메라와 똑같이 정면을 수평으로 바라보면 roll, pitch, yaw는 모두 0.0으로 두면 됩니다.
+# - 만약 카메라를 아래로 살짝 숙였다면 pitch에 양수(+) 각도(예: 10.0), 위로 들었다면 음수(-) 각도를 넣으세요.
+extrinsics:
+  x: 0.00      # 앞(+) / 뒤(-) [단위: m]
+  y: 0.00      # 왼쪽(+) / 오른쪽(-) [단위: m]
+  z: 0.17      # 위(+) / 아래(-) [단위: m]
+  roll: 0.0
+  pitch: 0.0
+  yaw: 0.0
+  use_degrees: true
+
+# 상단 카메라 수평 화각(HFOV) 설정 (웹캠+라이다 사람 위치 정합용)
+camera_intrinsics:
+  hfov_deg: 65.0     # 일반 스마트폰/웹캠 수평 화각 (기본 65도)
+
+# 도킹 스테이션(또는 출발 지점)의 저장된 맵(map) 기준 초기 위치
+# - ros2 run person_tracker init_pose 실행 시 이 값으로 AMCL 초기 위치를 잡습니다.
+initial_pose:
+  x: 0.0
+  y: 0.0
+  yaw: 0.0
+  use_degrees: true
