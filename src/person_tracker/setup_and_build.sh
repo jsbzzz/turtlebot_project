@@ -82,7 +82,11 @@ if [ -f "$VENV_DIR/bin/activate" ]; then
 fi
 source "/opt/ros/$ROS_DISTRO_FOUND/setup.bash"
 source "$WS_DIR/install/setup.bash"
-export ROS_DOMAIN_ID=\${ROS_DOMAIN_ID:-0}
+if [ -f "/etc/turtlebot4_discovery/setup.bash" ]; then
+    source "/etc/turtlebot4_discovery/setup.bash"
+fi
+export RMW_IMPLEMENTATION=\${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+export ROS_DOMAIN_ID=\${ROS_DOMAIN_ID:-4}
 echo "[person_tracker] 환경 로드 완료 (ROS_DISTRO=$ROS_DISTRO_FOUND, ROS_DOMAIN_ID=\$ROS_DOMAIN_ID)"
 EOF
 chmod +x "$WS_DIR/env_tracker.sh"
@@ -91,6 +95,6 @@ echo ""
 echo "✅ 설치 및 빌드가 모두 완료되었습니다!"
 echo "실행 방법:"
 echo "  source $WS_DIR/env_tracker.sh"
-echo "  ros2 run person_tracker camera_pub"
-echo "  ros2 run person_tracker bbox_tracker_node   # 바운딩 박스 방식"
-echo "  ros2 run person_tracker seg_tracker_node    # 세그멘테이션 마스크 방식"
+echo "  # [원클릭 통합 실행] 맵 + init_pose + 노트북 웹캠(0) + 트래커:"
+echo "  ros2 launch person_tracker bringup.launch.py video_source:=0"
+echo "  # (RViz2까지 같이 띄우려면 run_rviz:=true 추가)"

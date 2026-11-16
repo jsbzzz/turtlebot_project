@@ -345,6 +345,7 @@ class LidarPersonLocalizer:
         target: UnifiedTrackedPerson,
         frame_width: int,
         frame_height: int,
+        publish: bool = True,
     ) -> TargetLocalizationResult:
         x1, y1, x2, y2 = target.bbox
         cx, cy = target.center
@@ -462,7 +463,8 @@ class LidarPersonLocalizer:
             map_source=map_source,
             matched_rays=matched_rays,
         )
-        self._publish_target_outputs(res)
+        if publish:
+            self._publish_target_outputs(res)
         return res
 
     def _publish_target_outputs(self, res: TargetLocalizationResult):

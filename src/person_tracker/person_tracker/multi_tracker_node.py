@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 import time
@@ -17,7 +18,7 @@ from sensor_msgs.msg import CompressedImage, Image
 from geometry_msgs.msg import Point
 from cv_bridge import CvBridge
 
-from typing import Optional
+from typing import Optional, Tuple
 from person_tracker.multi_tracker_core import MultiModelTrackerCore, UnifiedTrackedPerson
 from person_tracker.lidar_person_localizer import LidarPersonLocalizer, TargetLocalizationResult
 
@@ -126,11 +127,16 @@ class MultiModelTrackerNode(Node):
         self.localizer = LidarPersonLocalizer(self)
         self.last_loc_result: Optional[TargetLocalizationResult] = None
         self.last_loc_log_time = 0.0
+        self.image_topic = image_topic
+        self.last_frame_wall_time = 0.0
+        self.last_display_frame: Optional[np.ndarray] = None
         self.win_name = 'TurtleBot4 Multi-Model Benchmark (v8 / v11 / v26 x Det / Seg / Pose)'
+        self.info_win_name = 'Tracker Status & Coordinates'
 
         if self.show_gui:
             cv2.namedWindow(self.win_name)
             cv2.setMouseCallback(self.win_name, self.on_mouse_click)
+            cv2.namedWindow(self.info_win_name)
 
         self.get_logger().info(
             f'MultiModelTrackerNode 시작됨 | 토픽: {image_topic} | 모델: {self.tracker.current_model_name} | '
@@ -307,28 +313,87 @@ class MultiModelTrackerNode(Node):
                 cv2.LINE_AA,
             )
 
-        # 3. 좌측 상단 반투명 성능 및 부위 가시성 + 라이다/맵 위치 HUD 패널
-        m = self.tracker.metrics
-        panel_x, panel_y = 8, self.TOTAL_BAR_HEIGHT + 8
-        panel_w, panel_h = 385, 214
-
+        # 3. 영상 좌측 상단에 작은 '맵 기준 좌표축 나침반' 표시 (화면 가림 최소화)
+        cam_status = self.localizer.get_camera_pose_status()
+        cx_cmp, cy_cmp = 48, self.TOTAL_BAR_HEIGHT + 52
+        radius = 28
         overlay = frame.copy()
-        cv2.rectangle(
-            overlay,
-            (panel_x, panel_y),
-            (panel_x + panel_w, panel_y + panel_h),
-            (18, 18, 18),
-            -1,
-        )
-        cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
-        cv2.rectangle(
+        cv2.circle(overlay, (cx_cmp, cy_cmp), radius + 6, (18, 18, 18), -1)
+        cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+        cv2.circle(frame, (cx_cmp, cy_cmp), radius, (110, 110, 110), 1, cv2.LINE_AA)
+
+        if cam_status.map_yaw_deg is not None:
+            psi = math.radians(cam_status.map_yaw_deg)
+            # Map +X 축을 현재 카메라 화면 좌표(위=-Y_img, 좌=-X_img)로 회전 투영
+            x_end = (int(cx_cmp + radius * 0.85 * math.sin(psi)), int(cy_cmp - radius * 0.85 * math.cos(psi)))
+            # Map +Y 축은 Map +X보다 +90도(psi - pi/2)
+            y_end = (int(cx_cmp + radius * 0.85 * math.sin(psi - math.pi * 0.5)), int(cy_cmp - radius * 0.85 * math.cos(psi - math.pi * 0.5)))
+            cv2.arrowedLine(frame, (cx_cmp, cy_cmp), x_end, (60, 70, 255), 2, cv2.LINE_AA, tipLength=0.28)
+            cv2.arrowedLine(frame, (cx_cmp, cy_cmp), y_end, (60, 230, 80), 2, cv2.LINE_AA, tipLength=0.28)
+            cv2.putText(frame, 'X', (x_end[0] + 3, x_end[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (80, 90, 255), 1, cv2.LINE_AA)
+            cv2.putText(frame, 'Y', (y_end[0] + 3, y_end[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (80, 240, 100), 1, cv2.LINE_AA)
+            cmp_title = f'Map Axes ({cam_status.map_source})'
+        else:
+            cv2.arrowedLine(frame, (cx_cmp, cy_cmp), (cx_cmp, cy_cmp - int(radius * 0.8)), (60, 70, 255), 2, cv2.LINE_AA, tipLength=0.28)
+            cv2.arrowedLine(frame, (cx_cmp, cy_cmp), (cx_cmp - int(radius * 0.8), cy_cmp), (60, 230, 80), 2, cv2.LINE_AA, tipLength=0.28)
+            cmp_title = 'Cam Axes (No Map)'
+
+        cv2.putText(
             frame,
-            (panel_x, panel_y),
-            (panel_x + panel_w, panel_y + panel_h),
-            (110, 110, 110),
+            cmp_title,
+            (10, self.TOTAL_BAR_HEIGHT + 16),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            (220, 220, 220),
             1,
+            cv2.LINE_AA,
         )
 
+        # 4. 별도 정보 창(Tracker Status & Coordinates)에 좌표 및 성능 표시
+        self._render_info_window(num_persons, cam_status)
+
+    def _draw_target_camera_axes(self, frame: np.ndarray, person: UnifiedTrackedPerson):
+        """타겟 중심에 카메라 기준(top_cam_link) 3D 좌표축(+X 정면, +Y 왼쪽, +Z 위) 방향 투영 표시."""
+        loc = self.last_loc_result
+        if loc is None:
+            return
+        h, w = frame.shape[:2]
+        half_w = max(1.0, w * 0.5)
+        fx = half_w / math.tan(math.radians(self.localizer.hfov_deg * 0.5))
+
+        cx_p, cy_p = person.center
+        tx, ty, tz = loc.cam_xyz
+        tx = max(0.35, tx)
+        axis_len = 0.35
+
+        def proj(dx: float, dy: float, dz: float) -> Tuple[int, int]:
+            px = max(0.20, tx + dx)
+            py = ty + dy
+            pz = tz + dz
+            u = int(half_w - fx * (py / px))
+            v = int(cy_p - fx * (pz / px))
+            return max(4, min(w - 4, u)), max(self.TOTAL_BAR_HEIGHT + 4, min(h - 4, v))
+
+        origin = (cx_p, cy_p)
+        ax_x = proj(axis_len, 0.0, 0.0)   # +X_cam (정면 깊이)
+        ax_y = proj(0.0, axis_len, 0.0)   # +Y_cam (왼쪽)
+        ax_z = proj(0.0, 0.0, axis_len)   # +Z_cam (위쪽)
+
+        cv2.arrowedLine(frame, origin, ax_x, (60, 70, 255), 2, cv2.LINE_AA, tipLength=0.25)
+        cv2.arrowedLine(frame, origin, ax_y, (60, 235, 80), 2, cv2.LINE_AA, tipLength=0.25)
+        cv2.arrowedLine(frame, origin, ax_z, (255, 160, 40), 2, cv2.LINE_AA, tipLength=0.25)
+        cv2.putText(frame, '+X', (ax_x[0] + 4, ax_x[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (80, 90, 255), 1, cv2.LINE_AA)
+        cv2.putText(frame, '+Y', (ax_y[0] + 4, ax_y[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (80, 245, 100), 1, cv2.LINE_AA)
+        cv2.putText(frame, '+Z', (ax_z[0] + 4, ax_z[1] - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 180, 70), 1, cv2.LINE_AA)
+
+    def _render_info_window(self, num_persons: int, cam_status=None, status_banner: str = ''):
+        """영상 화면을 가리지 않도록 별도 창에 성능·라이다·로봇/맵 좌표를 표시."""
+        if not self.show_gui:
+            return
+        if cam_status is None:
+            cam_status = self.localizer.get_camera_pose_status()
+
+        m = self.tracker.metrics
         vram_str = ''
         if 'CUDA' in m.device and torch.cuda.is_available():
             vram_mb = torch.cuda.memory_allocated() / (1024 * 1024)
@@ -336,7 +401,6 @@ class MultiModelTrackerNode(Node):
 
         adapt_str = f' [{m.adaptive_state}]' if self.tracker.mode == 5 else ''
 
-        cam_status = self.localizer.get_camera_pose_status()
         if cam_status.map_xyz is not None:
             mx, my, _ = cam_status.map_xyz
             yaw_d = cam_status.map_yaw_deg or 0.0
@@ -353,6 +417,8 @@ class MultiModelTrackerNode(Node):
         loc = self.last_loc_result
         if loc is not None:
             bx, by, _ = loc.base_xyz
+            cx_m, cy_m, _ = loc.cam_xyz
+            cam_tgt_line = f'Target(Cam): x={cx_m:+.2f}m y={cy_m:+.2f}m ({loc.cam_bearing_deg:+.1f}deg)'
             bot_line = (
                 f'Target(Bot): x={bx:+.2f}m y={by:+.2f}m '
                 f'({loc.base_dist_m:.2f}m, {loc.base_angle_deg:+.1f}deg) [{loc.source}]'
@@ -366,6 +432,7 @@ class MultiModelTrackerNode(Node):
                 map_line = 'Target(Map): Waiting for TF (run loc 4)'
                 map_color = (180, 180, 180)
         else:
+            cam_tgt_line = 'Target(Cam): -'
             bot_line = 'Target(Bot): Click person to lock target'
             bot_color = (170, 170, 170)
             map_line = 'Target(Map): -'
@@ -380,37 +447,110 @@ class MultiModelTrackerNode(Node):
             (f'Sys CPU: {self.cpu_percent:4.1f}% | RAM:{self.ram_mb:.0f}MB{vram_str}', (180, 255, 180)),
             (f'Persons: {num_persons} | Target:{self.tracker.target_id}{adapt_str}', (255, 220, 120)),
             (cam_pose_str, (220, 210, 255)),
+            (cam_tgt_line, (210, 240, 255)),
             (bot_line, bot_color),
             (map_line, map_color),
         ]
+        if status_banner:
+            lines.append((status_banner, (0, 200, 255)))
 
+        panel = np.full((280, 540, 3), 24, dtype=np.uint8)
         for idx, (text, color) in enumerate(lines):
-            y_pos = panel_y + 18 + idx * 19
             cv2.putText(
-                frame,
+                panel,
                 text,
-                (panel_x + 8, y_pos),
+                (14, 24 + idx * 22),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.41,
+                0.48,
                 color,
                 1,
                 cv2.LINE_AA,
             )
+        cv2.imshow(self.info_win_name, panel)
 
     def compressed_callback(self, msg: CompressedImage):
-        np_arr = np.frombuffer(msg.data, np.uint8)
-        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-        if frame is not None:
-            self.handle_frame(frame, msg.header.stamp)
+        try:
+            np_arr = np.frombuffer(msg.data, np.uint8)
+            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            if frame is not None:
+                self.handle_frame(frame, msg.header.stamp)
+        except Exception as exc:
+            self.get_logger().warn(f'Compressed image decode error: {exc}', throttle_duration_sec=5.0)
 
     def raw_callback(self, msg: Image):
-        frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        self.handle_frame(frame, msg.header.stamp)
+        try:
+            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            self.handle_frame(frame, msg.header.stamp)
+        except Exception as exc:
+            self.get_logger().warn(f'Raw image convert error: {exc}', throttle_duration_sec=5.0)
+
+    def _process_key(self, key: int):
+        if key in (ord('1'), ord('2'), ord('3'), ord('4'), ord('5')):
+            self.tracker.set_mode(int(chr(key)))
+        elif key in (ord('q'), ord('Q')):
+            self.tracker.set_model(family_idx=1)
+        elif key in (ord('w'), ord('W')):
+            self.tracker.set_model(family_idx=2)
+        elif key in (ord('e'), ord('E')):
+            self.tracker.set_model(family_idx=3)
+        elif key in (ord('a'), ord('A')):
+            self.tracker.set_model(task_idx=1)
+        elif key in (ord('s'), ord('S')):
+            self.tracker.set_model(task_idx=2)
+        elif key in (ord('f'), ord('F')):
+            self.tracker.set_model(task_idx=3)
+        elif key in (ord('d'), ord('D')):
+            self.tracker.toggle_device()
+        elif key in (ord('m'), ord('M')):
+            self.draw_overlay = not self.draw_overlay
+
+    def refresh_idle_gui(self):
+        """토픽이 아직 안 들어오거나 bag 재생이 멈췄을 때도 에러/창 멈춤 없이 대기 화면 유지."""
+        if not self.show_gui:
+            return
+        now = time.time()
+        # 최근 0.4초 이내에 새 프레임이 들어왔으면 handle_frame에서 이미 그렸으므로 생략
+        if now - self.last_frame_wall_time < 0.4:
+            return
+
+        if self.last_display_frame is not None:
+            idle_frame = self.last_display_frame.copy()
+            status_txt = f'PAUSED / WAITING TOPIC ({self.image_topic})'
+        else:
+            idle_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            status_txt = f'WAITING FOR TOPIC: {self.image_topic}'
+
+        h, w = idle_frame.shape[:2]
+        cv2.rectangle(idle_frame, (0, h - 34), (w, h), (20, 20, 20), -1)
+        cv2.putText(
+            idle_frame,
+            status_txt,
+            (12, h - 11),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (0, 220, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.imshow(self.win_name, idle_frame)
+        self._render_info_window(0, status_banner=status_txt)
+        key = cv2.waitKey(1) & 0xFF
+        if key != 255:
+            self._process_key(key)
+
+    def _estimate_candidate_spatial(self, person: UnifiedTrackedPerson, w: int, h: int):
+        res = self.localizer.localize_target(person, w, h, publish=False)
+        if res.map_xyz is not None:
+            return (res.map_xyz[0], res.map_xyz[1]), 'map', res.source
+        return (res.base_xyz[0], res.base_xyz[1]), 'base_link', res.source
 
     def handle_frame(self, frame: np.ndarray, msg_stamp):
         h, w = frame.shape[:2]
+        self.last_frame_wall_time = time.time()
         detections, target = self.tracker.process_frame(
-            frame, auto_lock_first=self.auto_lock_first
+            frame,
+            auto_lock_first=self.auto_lock_first,
+            spatial_estimator=self._estimate_candidate_spatial,
         )
         self._update_system_metrics(msg_stamp)
 
@@ -503,34 +643,21 @@ class MultiModelTrackerNode(Node):
                     )
 
             self._draw_hud(frame, len(detections))
+            self.last_display_frame = frame.copy()
             cv2.imshow(self.win_name, frame)
 
             key = cv2.waitKey(1) & 0xFF
-            if key in (ord('1'), ord('2'), ord('3'), ord('4'), ord('5')):
-                self.tracker.set_mode(int(chr(key)))
-            elif key in (ord('q'), ord('Q')):
-                self.tracker.set_model(family_idx=1)
-            elif key in (ord('w'), ord('W')):
-                self.tracker.set_model(family_idx=2)
-            elif key in (ord('e'), ord('E')):
-                self.tracker.set_model(family_idx=3)
-            elif key in (ord('a'), ord('A')):
-                self.tracker.set_model(task_idx=1)
-            elif key in (ord('s'), ord('S')):
-                self.tracker.set_model(task_idx=2)
-            elif key in (ord('f'), ord('F')):
-                self.tracker.set_model(task_idx=3)
-            elif key in (ord('d'), ord('D')):
-                self.tracker.toggle_device()
-            elif key in (ord('m'), ord('M')):
-                self.draw_overlay = not self.draw_overlay
+            if key != 255:
+                self._process_key(key)
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = MultiModelTrackerNode()
     try:
-        rclpy.spin(node)
+        while rclpy.ok():
+            rclpy.spin_once(node, timeout_sec=0.05)
+            node.refresh_idle_gui()
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:

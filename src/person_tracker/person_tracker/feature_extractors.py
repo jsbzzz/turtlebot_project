@@ -38,9 +38,13 @@ class BaseFeatureExtractor:
             return None
         if cv2.countNonZero(mask_roi) < 12:
             return None
-        hist = cv2.calcHist([hsv_roi], [0, 1], mask_roi, [18, 16], [0, 180, 0, 256])
-        cv2.normalize(hist, hist, alpha=1.0, norm_type=cv2.NORM_L1)
-        return hist.astype(np.float32)
+        # 색상+채도(H-S) 2D 히스토그램 + 무채색(검정/흰색/회색 옷) 구분용 밝기(V) 1D 히스토그램 결합
+        hs_hist = cv2.calcHist([hsv_roi], [0, 1], mask_roi, [18, 16], [0, 180, 0, 256])
+        cv2.normalize(hs_hist, hs_hist, alpha=1.0, norm_type=cv2.NORM_L1)
+        v_hist = cv2.calcHist([hsv_roi], [2], mask_roi, [16], [0, 256])
+        cv2.normalize(v_hist, v_hist, alpha=1.0, norm_type=cv2.NORM_L1)
+        combined = np.concatenate([0.72 * hs_hist.ravel(), 0.28 * v_hist.ravel()]).astype(np.float32)
+        return combined
 
     @staticmethod
     def hist_sim(h1: Optional[np.ndarray], h2: Optional[np.ndarray]) -> float:
@@ -49,12 +53,37 @@ class BaseFeatureExtractor:
         dist = cv2.compareHist(h1, h2, cv2.HISTCMP_BHATTACHARYYA)
         return float(max(0.0, 1.0 - dist))
 
+    @staticmethod
+    def _apply_exclude_boxes(
+        mask_roi: np.ndarray,
+        bbox: Tuple[int, int, int, int],
+        exclude_boxes: Optional[List[Tuple[int, int, int, int]]],
+    ) -> np.ndarray:
+        """다른 사람 박스와 겹치는 영역을 마스크에서 제외해 외형 오염을 방지합니다."""
+        if not exclude_boxes:
+            return mask_roi
+        x1, y1, x2, y2 = bbox
+        cleaned = mask_roi.copy()
+        rh, rw = cleaned.shape[:2]
+        for ox1, oy1, ox2, oy2 in exclude_boxes:
+            ix1 = max(x1, ox1) - x1
+            iy1 = max(y1, oy1) - y1
+            ix2 = min(x2, ox2) - x1
+            iy2 = min(y2, oy2) - y1
+            if ix2 > ix1 and iy2 > iy1:
+                cleaned[max(0, iy1):min(rh, iy2), max(0, ix1):min(rw, ix2)] = 0
+        # 제외 후 남은 픽셀이 너무 적으면 원본 유지
+        if cv2.countNonZero(cleaned) < 25:
+            return mask_roi
+        return cleaned
+
     def extract(
         self,
         frame: np.ndarray,
         bbox: Tuple[int, int, int, int],
         mask_poly: Optional[np.ndarray] = None,
         keypoints: Optional[np.ndarray] = None,
+        exclude_boxes: Optional[List[Tuple[int, int, int, int]]] = None,
     ) -> Optional[PartFeatureBank]:
         raise NotImplementedError
 
@@ -135,6 +164,7 @@ class BBoxFeatureExtractor(BaseFeatureExtractor):
         bbox: Tuple[int, int, int, int],
         mask_poly: Optional[np.ndarray] = None,
         keypoints: Optional[np.ndarray] = None,
+        exclude_boxes: Optional[List[Tuple[int, int, int, int]]] = None,
     ) -> Optional[PartFeatureBank]:
         h, w = frame.shape[:2]
         x1, y1, x2, y2 = bbox
@@ -150,7 +180,9 @@ class BBoxFeatureExtractor(BaseFeatureExtractor):
             return None
 
         roi_hsv = cv2.cvtColor(frame[cy1:cy2, cx1:cx2], cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(roi_hsv, np.array([0, 22, 28]), np.array([180, 255, 255]))
+        # 무채색(S=0~20) 옷도 포함되도록 S 하한을 0으로 두고, 극단적 암부 노이즈(V<15)만 제외
+        mask = cv2.inRange(roi_hsv, np.array([0, 0, 15]), np.array([180, 255, 255]))
+        mask = self._apply_exclude_boxes(mask, (cx1, cy1, cx2, cy2), exclude_boxes)
 
         full_hist = self.calc_hsv_hist(roi_hsv, mask)
         if full_hist is None:
@@ -180,6 +212,7 @@ class SegMaskFeatureExtractor(BaseFeatureExtractor):
         bbox: Tuple[int, int, int, int],
         mask_poly: Optional[np.ndarray] = None,
         keypoints: Optional[np.ndarray] = None,
+        exclude_boxes: Optional[List[Tuple[int, int, int, int]]] = None,
     ) -> Optional[PartFeatureBank]:
         h, w = frame.shape[:2]
         x1, y1, x2, y2 = (
@@ -205,10 +238,11 @@ class SegMaskFeatureExtractor(BaseFeatureExtractor):
         else:
             seg_mask[int(bh * 0.1):int(bh * 0.9), int(bw * 0.15):int(bw * 0.85)] = 255
 
-        valid_color = cv2.inRange(roi_hsv, np.array([0, 20, 25]), np.array([180, 255, 255]))
+        valid_color = cv2.inRange(roi_hsv, np.array([0, 0, 15]), np.array([180, 255, 255]))
         final_mask = cv2.bitwise_and(seg_mask, valid_color)
         if cv2.countNonZero(final_mask) < 20:
             final_mask = seg_mask
+        final_mask = self._apply_exclude_boxes(final_mask, (x1, y1, x2, y2), exclude_boxes)
 
         full_hist = self.calc_hsv_hist(roi_hsv, final_mask)
         if full_hist is None:
@@ -244,9 +278,10 @@ class PoseKeypointFeatureExtractor(BaseFeatureExtractor):
         bbox: Tuple[int, int, int, int],
         mask_poly: Optional[np.ndarray] = None,
         keypoints: Optional[np.ndarray] = None,
+        exclude_boxes: Optional[List[Tuple[int, int, int, int]]] = None,
     ) -> Optional[PartFeatureBank]:
         if keypoints is None or len(keypoints) < 17:
-            return BBoxFeatureExtractor().extract(frame, bbox)
+            return BBoxFeatureExtractor().extract(frame, bbox, exclude_boxes=exclude_boxes)
 
         h, w = frame.shape[:2]
         x1, y1, x2, y2 = (
@@ -260,7 +295,7 @@ class PoseKeypointFeatureExtractor(BaseFeatureExtractor):
             return None
 
         roi_hsv = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2HSV)
-        valid_color = cv2.inRange(roi_hsv, np.array([0, 20, 25]), np.array([180, 255, 255]))
+        valid_color = cv2.inRange(roi_hsv, np.array([0, 0, 15]), np.array([180, 255, 255]))
 
         # 로컬 ROI 좌표로 변환된 키포인트 (17, 3) -> [lx, ly, conf]
         kp = keypoints.copy()
@@ -299,9 +334,15 @@ class PoseKeypointFeatureExtractor(BaseFeatureExtractor):
             elif is_vis(ank_i):
                 cv2.circle(lower_mask, pt(ank_i), limb_thickness, 255, -1)
 
-        upper_mask = cv2.bitwise_and(upper_mask, valid_color)
-        mid_mask = cv2.bitwise_and(mid_mask, valid_color)
-        lower_mask = cv2.bitwise_and(lower_mask, valid_color)
+        upper_mask = self._apply_exclude_boxes(
+            cv2.bitwise_and(upper_mask, valid_color), (x1, y1, x2, y2), exclude_boxes
+        )
+        mid_mask = self._apply_exclude_boxes(
+            cv2.bitwise_and(mid_mask, valid_color), (x1, y1, x2, y2), exclude_boxes
+        )
+        lower_mask = self._apply_exclude_boxes(
+            cv2.bitwise_and(lower_mask, valid_color), (x1, y1, x2, y2), exclude_boxes
+        )
 
         upper_h = self.calc_hsv_hist(roi_hsv, upper_mask)
         mid_h = self.calc_hsv_hist(roi_hsv, mid_mask)

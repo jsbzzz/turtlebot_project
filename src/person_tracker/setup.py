@@ -15,6 +15,7 @@ package_name = 'person_tracker'
 model_files = [f for f in glob.glob('models/*.pt') if os.path.isfile(f)]
 launch_files = [f for f in glob.glob('launch/*.launch.py') if os.path.isfile(f)]
 config_files = [f for f in glob.glob('config/*.yaml') if os.path.isfile(f)]
+map_files = [f for f in glob.glob('maps/*') if os.path.isfile(f)]
 
 data_files = [
     ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
@@ -26,6 +27,8 @@ if launch_files:
     data_files.append(('share/' + package_name + '/launch', launch_files))
 if config_files:
     data_files.append(('share/' + package_name + '/config', config_files))
+if map_files:
+    data_files.append(('share/' + package_name + '/maps', map_files))
 
 setup(
     name=package_name,

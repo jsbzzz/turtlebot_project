@@ -1,8 +1,9 @@
 from dataclasses import dataclass
+import math
 import os
 import tempfile
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 from ultralytics import YOLO
@@ -122,8 +123,13 @@ class MultiModelTrackerCore:
         self.last_detections: List[UnifiedTrackedPerson] = []
         self.last_frame: Optional[np.ndarray] = None
 
-        self.reid_match_thresh = 0.50
-        self.id_switch_thresh = 0.34
+        # 라이다/맵 3D 위치 기반 타겟 기억 상태 (다른 사람과 혼동 방지용)
+        self.last_target_world_xy: Optional[Tuple[float, float]] = None
+        self.last_target_world_frame: str = ''
+        self.last_target_seen_time: float = 0.0
+
+        self.reid_match_thresh = 0.52
+        self.id_switch_thresh = 0.50
 
         self.current_model_name = self._build_model_filename(self.family_idx, self.task_idx)
         self.model = self._get_or_load_model(self.current_model_name)
@@ -241,6 +247,65 @@ class MultiModelTrackerCore:
                 return True
         return False
 
+    def _compute_spatial_score(
+        self,
+        person: UnifiedTrackedPerson,
+        frame_w: int,
+        frame_h: int,
+        spatial_estimator: Optional[
+            Callable[[UnifiedTrackedPerson, int, int], Optional[Tuple[Tuple[float, float], str, str]]]
+        ],
+    ) -> Tuple[float, Optional[float]]:
+        """
+        직전 확인된 타겟의 3D(map 또는 base_link) 위치와 경과 시간을 바탕으로
+        후보가 물리적 이동 반경 안에 있는지 [0.0 ~ 1.0] 공간 점수와 거리(m)를 반환.
+        """
+        if (
+            spatial_estimator is None
+            or self.last_target_world_xy is None
+            or not self.last_target_world_frame
+        ):
+            return 1.0, None
+
+        dt = max(0.0, time.time() - self.last_target_seen_time)
+        if dt > 8.0:
+            return 1.0, None
+
+        est = spatial_estimator(person, frame_w, frame_h)
+        if est is None:
+            return 1.0, None
+
+        cand_xy, cand_frame, source = est
+        if cand_frame != self.last_target_world_frame:
+            return 1.0, None
+
+        dist_m = math.hypot(
+            cand_xy[0] - self.last_target_world_xy[0],
+            cand_xy[1] - self.last_target_world_xy[1],
+        )
+        # 사람 보행 속도(~1.35m/s) + 센서 측정 여유(0.65m)
+        allowed_radius = 0.65 + 1.35 * min(dt, 6.0)
+        sigma = max(0.55, 0.55 * allowed_radius)
+        score = math.exp(-0.5 * (dist_m / sigma) ** 2)
+
+        # 라이다 실측 거리가 물리적 이동 가능 반경을 크게 벗어나면 강한 패널티
+        if source == 'LiDAR' and dist_m > allowed_radius * 1.4:
+            score *= 0.20
+
+        return float(score), dist_m
+
+    def _score_candidate(
+        self,
+        person: UnifiedTrackedPerson,
+        frame_w: int,
+        frame_h: int,
+        spatial_estimator,
+    ) -> float:
+        sp_score, _ = self._compute_spatial_score(person, frame_w, frame_h, spatial_estimator)
+        if self.last_target_world_xy is None or spatial_estimator is None:
+            return person.similarity
+        return 0.65 * person.similarity + 0.35 * sp_score
+
     def _lock_target_bank(self, frame: np.ndarray, person: UnifiedTrackedPerson):
         bank = self.current_extractor.extract(
             frame, person.bbox, person.mask_poly, person.keypoints
@@ -257,6 +322,9 @@ class MultiModelTrackerCore:
                 self.target_id = person.track_id
                 self.last_target_bbox = person.bbox
                 self.pending_tracker_rebind = False
+                self.last_target_world_xy = None
+                self.last_target_world_frame = ''
+                self.last_target_seen_time = 0.0
                 if self.last_frame is not None:
                     self._lock_target_bank(self.last_frame, person)
                 return self.target_id
@@ -266,10 +334,18 @@ class MultiModelTrackerCore:
         self.recent_bank = None
         self.last_target_bbox = None
         self.pending_tracker_rebind = False
+        self.last_target_world_xy = None
+        self.last_target_world_frame = ''
+        self.last_target_seen_time = 0.0
         return None
 
     def process_frame(
-        self, frame: np.ndarray, auto_lock_first: bool = False
+        self,
+        frame: np.ndarray,
+        auto_lock_first: bool = False,
+        spatial_estimator: Optional[
+            Callable[[UnifiedTrackedPerson, int, int], Optional[Tuple[Tuple[float, float], str, str]]]
+        ] = None,
     ) -> Tuple[List[UnifiedTrackedPerson], Optional[UnifiedTrackedPerson]]:
         t_start = time.perf_counter()
         self.last_frame = frame
@@ -400,13 +476,31 @@ class MultiModelTrackerCore:
 
                 # 2. 모드 2 (Task-ReID) & 모드 4 (BoT+ReID)
                 if self.mode in self.REID_ACTIVE_MODES and self.anchor_bank is not None:
-                    if current_target is not None and current_target.similarity < self.id_switch_thresh:
-                        current_target.is_target = False
-                        current_target = None
+                    if current_target is not None:
+                        _, cur_dist = self._compute_spatial_score(
+                            current_target, w, h, spatial_estimator
+                        )
+                        eff_switch_thresh = (
+                            self.id_switch_thresh * 0.85
+                            if (cur_dist is not None and cur_dist <= 0.55)
+                            else self.id_switch_thresh
+                        )
+                        if current_target.similarity < eff_switch_thresh:
+                            current_target.is_target = False
+                            current_target = None
 
                     if current_target is None and len(detections) > 0:
-                        best_candidate = max(detections, key=lambda p: p.similarity)
-                        if best_candidate.similarity >= self.reid_match_thresh:
+                        best_candidate = max(
+                            detections,
+                            key=lambda p: self._score_candidate(p, w, h, spatial_estimator),
+                        )
+                        cand_score = self._score_candidate(
+                            best_candidate, w, h, spatial_estimator
+                        )
+                        if (
+                            best_candidate.similarity >= self.reid_match_thresh * 0.85
+                            and cand_score >= self.reid_match_thresh
+                        ):
                             self.target_id = best_candidate.track_id
                             best_candidate.is_target = True
                             current_target = best_candidate
@@ -428,27 +522,57 @@ class MultiModelTrackerCore:
                                 self.anchor_bank, self.recent_bank, b
                             )
                         if len(detections) > 0:
-                            best_candidate = max(detections, key=lambda p: p.similarity)
-                            if best_candidate.similarity >= self.reid_match_thresh:
+                            best_candidate = max(
+                                detections,
+                                key=lambda p: self._score_candidate(p, w, h, spatial_estimator),
+                            )
+                            cand_score = self._score_candidate(
+                                best_candidate, w, h, spatial_estimator
+                            )
+                            if (
+                                best_candidate.similarity >= self.reid_match_thresh * 0.85
+                                and cand_score >= self.reid_match_thresh
+                            ):
                                 self.target_id = best_candidate.track_id
                                 best_candidate.is_target = True
                                 current_target = best_candidate
                                 adaptive_state = 'RECOVERED'
                     elif self._is_crowded_near_target(current_target, detections):
                         adaptive_state = 'GUARD'
+                        scored_list = []
                         for p in detections:
-                            b = extractor.extract(frame, p.bbox, p.mask_poly, p.keypoints)
+                            other_boxes = [o.bbox for o in detections if o.track_id != p.track_id]
+                            b = extractor.extract(
+                                frame, p.bbox, p.mask_poly, p.keypoints, exclude_boxes=other_boxes
+                            )
                             person_banks[p.track_id] = b
                             if b is not None:
                                 p.visible_parts = b.visible_parts
                             p.similarity = extractor.compute_dual_similarity(
                                 self.anchor_bank, self.recent_bank, b
                             )
-                        if current_target.similarity < self.id_switch_thresh:
-                            best_candidate = max(detections, key=lambda p: p.similarity)
-                            if best_candidate.similarity >= self.reid_match_thresh:
-                                self.target_id = best_candidate.track_id
-                                current_target = best_candidate
+                            sp_score, sp_dist = self._compute_spatial_score(
+                                p, w, h, spatial_estimator
+                            )
+                            comb = (
+                                0.60 * p.similarity + 0.40 * sp_score
+                                if (self.last_target_world_xy is not None and spatial_estimator is not None)
+                                else p.similarity
+                            )
+                            # 현재 track_id에는 미세한 관성 보너스만 부여 (+0.04), 단 라이다상 급점프(>0.9m) 시 제거
+                            if p.track_id == current_target.track_id and (sp_dist is None or sp_dist <= 0.90):
+                                comb += 0.04
+                            scored_list.append((comb, p))
+
+                        scored_list.sort(key=lambda item: item[0], reverse=True)
+                        best_comb, best_candidate = scored_list[0]
+                        if (
+                            best_candidate.track_id != current_target.track_id
+                            and best_candidate.similarity >= self.reid_match_thresh * 0.85
+                            and best_comb >= self.reid_match_thresh
+                        ):
+                            self.target_id = best_candidate.track_id
+                            current_target = best_candidate
                     else:
                         adaptive_state = 'SAFE'
                         t_bank = extractor.extract(
@@ -462,7 +586,7 @@ class MultiModelTrackerCore:
                         current_target.similarity = extractor.compute_dual_similarity(
                             self.anchor_bank, self.recent_bank, t_bank
                         )
-                        if current_target.similarity >= 0.62:
+                        if len(detections) == 1 and current_target.similarity >= 0.72:
                             extractor.update_recent_bank(self.recent_bank, t_bank)
 
             for p in detections:
@@ -470,6 +594,11 @@ class MultiModelTrackerCore:
                 if p.is_target:
                     target_person = p
                     self.last_target_bbox = p.bbox
+                    if spatial_estimator is not None:
+                        est = spatial_estimator(p, w, h)
+                        if est is not None:
+                            self.last_target_world_xy, self.last_target_world_frame, _ = est
+                            self.last_target_seen_time = time.time()
         else:
             if self.mode == self.MODE_ADAPTIVE and self.target_id is not None:
                 adaptive_state = 'SEARCH'
