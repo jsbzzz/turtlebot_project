@@ -5,7 +5,7 @@
 # ==============================================================================
 
 namespace: "/robot4"
-video_source: "http://192.168.108.100:4747/video"   # 스마트폰 DroidCam URL 또는 웹캠 번호("2")
+video_source: "0"   # "0": 노트북 웹캠 | 스마트폰 DroidCam 예: "http://192.168.107.100:4747/video"
 
 topics:
   raw_topic: "/top_cam/image_raw"                   # 실제 발행: /robot4/top_cam/image_raw

@@ -130,15 +130,24 @@ class LidarPersonLocalizer:
         self._initial_odom_inv: Optional[np.ndarray] = None
 
         self.hfov_deg = float(intr_cfg.get('hfov_deg', 65.0))
-        self.xyz = (
-            float(ext_cfg.get('x', 0.0)),
-            float(ext_cfg.get('y', 0.0)),
-            float(ext_cfg.get('z', 0.17)),
-        )
-        roll = float(ext_cfg.get('roll', 0.0))
-        pitch = float(ext_cfg.get('pitch', 0.0))
-        yaw = float(ext_cfg.get('yaw', 0.0))
-        if bool(ext_cfg.get('use_degrees', True)):
+
+        # 실행 시 노드 파라미터로도 카메라 위치/각도를 덮어쓸 수 있도록 지원
+        def _param_or_cfg(p_name: str, default_val):
+            if not node.has_parameter(p_name):
+                node.declare_parameter(p_name, default_val)
+            return node.get_parameter(p_name).value
+
+        cam_x = float(_param_or_cfg('cam_x', float(ext_cfg.get('x', 0.0))))
+        cam_y = float(_param_or_cfg('cam_y', float(ext_cfg.get('y', 0.0))))
+        cam_z = float(_param_or_cfg('cam_z', float(ext_cfg.get('z', 0.17))))
+        roll = float(_param_or_cfg('cam_roll', float(ext_cfg.get('roll', 0.0))))
+        pitch = float(_param_or_cfg('cam_pitch', float(ext_cfg.get('pitch', 0.0))))
+        yaw = float(_param_or_cfg('cam_yaw', float(ext_cfg.get('yaw', 0.0))))
+        use_deg = bool(_param_or_cfg('cam_use_degrees', bool(ext_cfg.get('use_degrees', True))))
+        publish_cam_tf = bool(_param_or_cfg('publish_cam_tf', True))
+
+        self.xyz = (cam_x, cam_y, cam_z)
+        if use_deg:
             self.rpy_rad = (math.radians(roll), math.radians(pitch), math.radians(yaw))
         else:
             self.rpy_rad = (roll, pitch, yaw)
@@ -155,8 +164,13 @@ class LidarPersonLocalizer:
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
         )
-        self.tf_static_pub = node.create_publisher(TFMessage, self.tf_static_topic, static_qos)
-        self._publish_static_cam_tf()
+        self.tf_static_pub = (
+            node.create_publisher(TFMessage, self.tf_static_topic, static_qos)
+            if publish_cam_tf
+            else None
+        )
+        if publish_cam_tf:
+            self._publish_static_cam_tf()
 
         self.tf_sub = node.create_subscription(
             TFMessage, self.tf_topic, self._on_tf_msg, qos_profile_sensor_data

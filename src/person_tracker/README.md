@@ -60,14 +60,24 @@ ros2 launch person_tracker bringup.launch.py video_source:=0
 # RViz2까지 한 번에 띄우기
 ros2 launch person_tracker bringup.launch.py video_source:=0 run_rviz:=true
 
-# 다른 로봇 번호(/robot5 등) 또는 다른 맵 파일 사용 시
-ros2 launch person_tracker bringup.launch.py namespace:=/robot5 map:=/path/to/your_map.yaml video_source:=0
+# 카메라 방향/높이를 실행 시 바로 변경할 때 (예: 로봇 뒤쪽을 보게 180도 회전)
+ros2 launch person_tracker bringup.launch.py video_source:=0 yaw:=180.0 z:=0.17
 
-# 스마트폰 DroidCam 스트림 사용 시
-ros2 launch person_tracker bringup.launch.py video_source:=http://192.168.108.100:4747/video
+# 다른 로봇 번호(/robot1 등) 또는 다른 맵 파일 사용 시
+ros2 launch person_tracker bringup.launch.py namespace:=/robot1 map:=/path/to/your_map.yaml video_source:=0
 
-# 맵 로컬라이제이션 없이 카메라+라이다(로봇 기준 좌표)만 빠르게 테스트할 때
+# 다른 노트북에서 phone_camera만 켜고, 내 PC는 loc + init_pose + 트래커만 켤 때
+ros2 launch person_tracker bringup.launch.py namespace:=/robot1 run_camera:=false
+
+# 서버/다른 PC에 이미 loc(map_server/amcl)이 켜져 있을 때 (중복 방지)
 ros2 launch person_tracker bringup.launch.py use_localization:=false video_source:=0
+
+# 터틀봇 기본 OAK-D 카메라(preview) 사용 시
+ros2 launch person_tracker bringup.launch.py use_oakd:=true
+
+# 스마트폰 DroidCam 스트림 또는 가상 카메라(/dev/video2) 사용 시
+ros2 launch person_tracker bringup.launch.py video_source:=http://192.168.107.<핸드폰IP>:4747/video
+ros2 launch person_tracker bringup.launch.py video_source:=2
 ```
 
 ### ② 터미널별 개별 실행 (디버깅 / 분리 실행용)
@@ -75,14 +85,37 @@ ros2 launch person_tracker bringup.launch.py use_localization:=false video_sourc
 # [터미널 1] 맵 로컬라이제이션
 ros2 launch turtlebot4_navigation localization.launch.py namespace:=/robot4 map:=$(ros2 pkg prefix person_tracker)/share/person_tracker/maps/gallery.yaml
 
-# [터미널 2] AMCL 초기 위치 발행 (config/phone_camera.yaml의 initial_pose 사용)
+# [터미널 2] AMCL 초기 위치 발행 (기본 config/phone_camera.yaml의 initial_pose 사용, 파라미터 덮어쓰기 가능)
 ros2 run person_tracker init_pose
+# 예) 좌표 지정 시: ros2 run person_tracker init_pose --ros-args -p x:=1.5 -p y:=-0.3 -p yaw:=90.0
 
 # [터미널 3] 노트북 웹캠(0) + 상단 캠 TF 발행
 ros2 launch person_tracker phone_camera.launch.py video_source:=0
 
 # [터미널 4] 멀티 트래커 (영상에서 사람을 마우스 왼쪽 클릭해 타겟 지정)
 ros2 run person_tracker multi_tracker_node
+# 예) 각도 지정 시: ros2 run person_tracker multi_tracker_node --ros-args -p cam_yaw:=180.0
+```
+
+### ③ 다른 컴퓨터에서 `src/person_tracker`만 최신화해서 쓰기
+1. 이미 리포지토리를 클론해 둔 PC에서 `src/person_tracker`만 꺼내서 갱신할 때:
+```bash
+cd ~/turtlebot_project
+git fetch origin
+git checkout origin/main -- src/person_tracker
+colcon build --symlink-install --packages-select person_tracker
+```
+2. 기존 워크스페이스(`~/turtlebot4_ws` 등)에 `src/person_tracker` 폴더만 부분 클론(`sparse-checkout`)으로 연결할 때:
+```bash
+# 최초 1회
+git clone --filter=blob:none --no-checkout https://github.com/jsbzzz/turtlebot_project.git ~/tb_sync
+cd ~/tb_sync && git sparse-checkout set src/person_tracker && git checkout main
+ln -s ~/tb_sync/src/person_tracker ~/turtlebot4_ws/src/person_tracker
+cd ~/turtlebot4_ws && colcon build --symlink-install --packages-select person_tracker
+
+# 이후 업데이트
+cd ~/tb_sync && git pull origin main
+cd ~/turtlebot4_ws && colcon build --symlink-install --packages-select person_tracker
 ```
 
 ---

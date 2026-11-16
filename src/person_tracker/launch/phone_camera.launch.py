@@ -65,6 +65,7 @@ def _launch_setup(context, *args, **kwargs):
 
     # /robot4/tf, /robot4/tf_static 구독을 위한 리매핑
     tf_remaps = [('/tf', 'tf'), ('/tf_static', 'tf_static')]
+    use_sim_time = _to_bool(_pick('use_sim_time', False), False)
 
     top_cam_tf_node = Node(
         package='person_tracker',
@@ -85,9 +86,11 @@ def _launch_setup(context, *args, **kwargs):
             'yaw': yaw,
             'use_degrees': use_deg,
             'log_interval': log_interval,
+            'use_sim_time': use_sim_time,
         }],
     )
 
+    publish_camera = _to_bool(_pick('publish_camera', True), True)
     camera_pub = Node(
         package='person_tracker',
         executable='camera_pub',
@@ -102,10 +105,11 @@ def _launch_setup(context, *args, **kwargs):
             'publish_compressed': publish_compressed,
             'frame_id': optical_frame,
             'publish_tf': False,  # TF 발행 및 좌표 출력은 top_cam_tf_node가 전담
+            'use_sim_time': use_sim_time,
         }],
     )
 
-    return [top_cam_tf_node, camera_pub]
+    return [top_cam_tf_node, camera_pub] if publish_camera else [top_cam_tf_node]
 
 
 def generate_launch_description():
@@ -135,5 +139,7 @@ def generate_launch_description():
         DeclareLaunchArgument('yaw', default_value='', description='Z축 회전'),
         DeclareLaunchArgument('use_degrees', default_value='', description='true면 각도를 도(deg) 단위로 해석'),
         DeclareLaunchArgument('log_interval', default_value='', description='좌표 로그 출력 주기 [s]'),
+        DeclareLaunchArgument('publish_camera', default_value='true', description='camera_pub 실행 여부 (false면 TF 노드만 실행)'),
+        DeclareLaunchArgument('use_sim_time', default_value='false', description='시뮬레이션 시간 사용 여부'),
     ]
     return LaunchDescription(args + [OpaqueFunction(function=_launch_setup)])
