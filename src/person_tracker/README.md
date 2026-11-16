@@ -15,6 +15,7 @@ TurtleBot4(ROS 2 Jazzy)의 **2D LiDAR(`/robot4/scan`)**, **상단 추가 카메�
   - 로봇 몸체(`base_link`) 및 저장된 맵(`map`) 기준 좌표 산출 및 3D 공간 게이팅
 - **원클릭 통합 실행 (`bringup.launch.py`)**
   - 저장된 맵 로컬라이제이션(`localization.launch.py`) + 초기 위치(`init_pose`) + 노트북 웹캠(`video_source:=0`) + `top_cam_tf` + `multi_tracker_node` 일괄 실행
+- **상세 알고리즘 문서**: [ALGORITHM.md](ALGORITHM.md) (HSV+V 특징 추출, `PartFeatureBank`, `Adaptive` 상태 머신, 3D 공간 게이팅, 핀홀·LiDAR 정합 원리)
 
 ---
 
